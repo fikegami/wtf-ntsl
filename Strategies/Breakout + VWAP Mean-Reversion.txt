@@ -1,0 +1,191 @@
+// ===============================
+// Breakout + VWAP Mean-Reversion
+// Timeframe: 2–5 minutes (recommended)
+// Market: Index futures / liquid assets
+// ===============================
+
+input
+// --- Session & behavior ---
+Start1(0935), End1(1130),         // Favor US index futures: 09:35–11:30 ET
+Start2(1400), End2(1600),         // and 14:00–16:00 ET; avoid lunch lull
+TradeFridays(true),               // Option to disable e.g. Friday PM if desired
+CancelPendingsAtEnd(true),
+
+// --- Sizing & risk ---
+UseRiskSizing(true),
+RiskPerTradeUSD(200.0),           // $ risk per trade
+PointValue(20.0),                 // $ per full point (e.g., /NQ = $20 per point)
+ATR_Period(14), ATR_Type(2),      // Welles Wilder ATR
+ATR_StopMult(1.7),                // Initial stop distance in ATR
+ProfitRR(1.2),                    // Default take-profit multiple of risk (R)
+
+// --- Breakout leg ---
+BreakoutLen(20),                  // Donchian-like lookback (bars)
+MaxVWAPZ_ForBreakout(0.8),        // Only break if not far from VWAP
+UseStopEntriesForBreakout(true),  // Place stop orders at levels
+
+// --- Mean-reversion leg (to VWAP) ---
+VWAP_Z_Period(50),                // StdDev window for z-score
+VWAP_Z_Sell( +1.75),              // Short when price >= VWAP + z*std
+VWAP_Z_Buy(  -1.75),              // Long  when price <= VWAP - z*std
+AvoidMR_When_ATR_Rising(true),    // optional guard
+
+// --- Ops / misc ---
+MaxConcurrentPositions(1),        // This hybrid runs one position at a time
+ConsoleDebug(false),              // Flip on for live logs
+QtyFallback(1.0);                 // Fallback fixed qty if UseRiskSizing=false
+
+var
+// price & stats
+vwap    : Float;
+dev     : Float;
+z       : Float;
+atr     : Float;
+
+// breakout levels
+hiBrk   : Float;
+loBrk   : Float;
+
+// risk & qty
+riskPts : Float;
+qty     : Float;
+
+// helpers
+inSess  : Boolean;
+canTrade: Boolean;
+isBreakoutLong  : Boolean;
+isBreakoutShort : Boolean;
+longMR  : Boolean;
+shortMR : Boolean;
+
+// local funcs
+function InSession(): Boolean
+begin
+  // Simple 2-window session filter; times are HHMM (exchange clock)
+  // Adjust Start*/End* to your venue; CME Globex for /NQ typically aligns well.
+  result := ((Time >= Start1) and (Time <= End1)) or ((Time >= Start2) and (Time <= End2));
+end;
+
+function Friday(): Boolean
+begin
+  // DayOfWeek: Monday=1 ... Sunday=7  (commonly used in trading DSLs)
+  // If your environment differs, adapt accordingly.
+  result := (DayOfWeek = 5);
+end;
+
+function CalcQtyFromRisk(stopDistancePts : Float): Float
+var contracts : Float;
+begin
+  // Contracts = floor( RiskUSD / ( stopDistancePts * $/pt ) )
+  if stopDistancePts <= 0 then
+    contracts := 0
+  else
+    contracts := Floor(RiskPerTradeUSD / (stopDistancePts * PointValue));
+
+  // Respect platform min lot = 1
+  if contracts < 1 then contracts := 1;
+
+  result := contracts;
+end;
+
+begin
+  // --- Compute core indicators ---
+  vwap := SampleVWAP(0);                                         // central VWAP line  :contentReference[oaicite:8]{index=8}
+  dev  := Max(1e-6, StdDevConstPeriod(Close, VWAP_Z_Period));     // std dev of Close   :contentReference[oaicite:9]{index=9}
+  z    := (Close - vwap) / dev;
+
+  atr  := AvgTrueRange(ATR_Period, ATR_Type);                     // volatility         :contentReference[oaicite:10]{index=10}
+
+  // --- Breakout reference levels (Donchian-style) ---
+  hiBrk := Highest(High,  BreakoutLen);                           // user function set  :contentReference[oaicite:11]{index=11}
+  loBrk := Lowest(Low,    BreakoutLen);
+
+  // --- Session and day filters ---
+  inSess   := InSession();
+  canTrade := inSess and (MaxConcurrentPositions <= 1) and (not HasPosition);
+  if (not TradeFridays) and Friday() then
+    canTrade := false;
+
+  // --- Breakout conditions (only if price isn’t far from VWAP) ---
+  isBreakoutLong  := (Close >= hiBrk) and (Abs(z) <= MaxVWAPZ_ForBreakout);
+  isBreakoutShort := (Close <= loBrk) and (Abs(z) <= MaxVWAPZ_ForBreakout);
+
+  // --- Mean-reversion conditions (fade extremes back to VWAP) ---
+  longMR  := (z <= VWAP_Z_Buy);
+  shortMR := (z >= VWAP_Z_Sell);
+
+  if AvoidMR_When_ATR_Rising then begin
+    // Light volatility guard: require current ATR not exploding vs prior
+    if (atr > AvgTrueRange(ATR_Period, ATR_Type)[1]) then begin
+      longMR  := longMR  and (Close < hiBrk);  // don't fade if also breaking out
+      shortMR := shortMR and (Close > loBrk);
+    end;
+  end;
+
+  // --- Derive stop distance and size (in points) for new trades ---
+  riskPts := ATR_StopMult * atr;                                   // stop = entry ± ATR*mult
+  if UseRiskSizing then
+    qty := CalcQtyFromRisk(riskPts)
+  else
+    qty := QtyFallback;
+
+  // ========== ENTRY LOGIC ==========
+  // Only one active position at a time
+  if canTrade then begin
+
+    // 1) Breakout entries via stop orders at the levels
+    if UseStopEntriesForBreakout then begin
+      if isBreakoutLong then
+        BuyStop(hiBrk, hiBrk, qty);                                // stop/limit per manual  :contentReference[oaicite:12]{index=12}
+
+      if isBreakoutShort then
+        SellShortStop(loBrk, loBrk, qty);                          // symmetrical short stop  :contentReference[oaicite:13]{index=13}
+    end
+    else begin
+      if isBreakoutLong then
+        BuyAtMarket(qty);                                          // market alternative  :contentReference[oaicite:14]{index=14}
+      if isBreakoutShort then
+        SellShortAtMarket(qty);                                    // market alternative  :contentReference[oaicite:15]{index=15}
+    end;
+
+    // 2) Mean-reversion legs: market entries when stretched vs VWAP
+    if shortMR then
+      SellShortAtMarket(qty);                                      // fade down to VWAP    :contentReference[oaicite:16]{index=16}
+
+    if longMR then
+      BuyAtMarket(qty);                                            // fade up to VWAP      :contentReference[oaicite:17]{index=17}
+  end;
+
+  // ========== EXIT LOGIC ==========
+  // Protective stops: ATR-based from entry price (per-trade)
+  if IsBought then begin                                           // long protective stop
+    // Place a sell stop at (entry - riskPts); limit autocalculated if omitted
+    SellToCoverStop(BuyPrice - riskPts, BuyPrice - riskPts, PositionQty);   // :contentReference[oaicite:18]{index=18}
+
+    // Take-profit: default R multiple from entry or mean-revert target at VWAP
+    // If mean-reversion entry and price below VWAP: aim to VWAP; else R target.
+    if (Close < vwap) then
+      BuyToCoverLimit(vwap, PositionQty)                           // TP at VWAP           :contentReference[oaicite:19]{index=19}
+    else
+      BuyToCoverLimit(BuyPrice + ProfitRR * riskPts, PositionQty);
+  end;
+
+  if IsSold then begin                                             // short protective stop
+    BuyToCoverStop(MyPrice + riskPts, MyPrice + riskPts, PositionQty);      // symmetrical stop   :contentReference[oaicite:20]{index=20}
+    // Take-profit to VWAP (if above) or R multiple otherwise
+    if (Close > vwap) then
+      BuyToCoverLimit(vwap, PositionQty)                           // cover at VWAP        :contentReference[oaicite:21]{index=21}
+    else
+      BuyToCoverLimit(MyPrice - ProfitRR * riskPts, PositionQty);
+  end;
+
+  // ========== HOUSEKEEPING ==========
+  // Optional: cancel any dangling stop entries after session ends
+  if CancelPendingsAtEnd and (Time > End2) then
+    CancelPendingOrders;                                           // utility per manual   :contentReference[oaicite:22]{index=22}
+
+  if ConsoleDebug then begin
+    ConsoleLog("z=" + FloatToStr(z) + " vwap=" + FloatToStr(vwap) + " atr=" + FloatToStr(atr));
+  end;
+
+end;
